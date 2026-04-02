@@ -1,5 +1,6 @@
 'use strict';
 import { AV_COLORS, EMOJIS } from './config.js';
+import { LS_THEME }          from './constants.js';
 import { S } from './state.js';
 
 /* ═══════════════════════════════════════════════════════════
@@ -93,11 +94,24 @@ export function scrollBottom(onlyIfNear = false) {
 /* ═══════════════════════════════════════════════════════════
    THEME TOGGLE
 ═══════════════════════════════════════════════════════════ */
+export function initTheme() {
+  try {
+    const saved = localStorage.getItem(LS_THEME);
+    if (saved === 'light' || saved === 'dark') {
+      S.theme = saved;
+      document.documentElement.dataset.theme = S.theme === 'light' ? 'light' : '';
+      const icon = S.theme === 'light' ? '☀️' : '🌙';
+      document.querySelectorAll('#theme-btn, #chat-theme-btn').forEach(b => { b.textContent = icon; });
+    }
+  } catch (_) { /* ignore cross-origin localStorage errors if any */ }
+}
+
 export function toggleTheme() {
   S.theme = S.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = S.theme === 'light' ? 'light' : '';
   const icon = S.theme === 'light' ? '☀️' : '🌙';
   document.querySelectorAll('#theme-btn, #chat-theme-btn').forEach(b => { b.textContent = icon; });
+  try { localStorage.setItem(LS_THEME, S.theme); } catch (_) {}
 }
 
 /* ═══════════════════════════════════════════════════════════

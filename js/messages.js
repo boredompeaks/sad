@@ -1,5 +1,7 @@
 'use strict';
-import { PAGE_SIZE, MAX_MSG, PBKDF2_ITER, TYPING_THROTTLE, TYPING_TIMEOUT, DECOY } from './config.js';
+import { PAGE_SIZE, MAX_MSG, TYPING_THROTTLE, TYPING_TIMEOUT, DECOY } from './config.js';
+import { SLOT_PREFIX, OPTIMISTIC_PREFIX, CHAT_CHANNEL_PREFIX,
+         CHANNEL_SEPARATOR, EVT_TYPING }          from './constants.js';
 import { S }                        from './state.js';
 import { wCall, wCallProgress }     from './crypto.js';
 import { toast, scrollBottom, resizeTA, showDecryptProg,
@@ -36,6 +38,15 @@ function decodeContent(plain) {
 ═══════════════════════════════════════════════════════════ */
 export async function openChat(peer) {
   if (!peer?.slot || !peer?.name) return;
+
+  // ── Cleanly teardown previous chat state ──
+  if (S.peer && _msgCh) {
+    bcastTyping(false); // tell previous peer we stopped typing
+  }
+  clearTimeout(S.typingTimer);
+  clearTimeout(S.typingAutoHide);
+  S.isTyping = false;
+
   const myToken = ++S.chatToken;
   S.peer = peer;
   S.isDecoy = false;
@@ -75,7 +86,9 @@ export async function openChat(peer) {
   let cachedRows = [];
   try {
     cachedRows = await getMessages(S.me.slot, peer.slot);
-  } catch (_) { /* IndexedDB unavailable — continue to network */ }
+  } catch (e) {
+    console.warn('[openChat] IndexedDB read failed:', e);
+  }
 
   if (cachedRows.length > 0 && myToken === S.chatToken) {
     cachedRows.forEach(row => {
@@ -123,8 +136,8 @@ function _removeSkeleton() { document.getElementById('skel')?.remove(); }
    LOAD HISTORY
 ═══════════════════════════════════════════════════════════ */
 export async function loadHistory(token, prepend = false) {
-  const me   = 'slot_' + S.me.slot;
-  const peer = 'slot_' + S.peer.slot;
+  const me   = SLOT_PREFIX + S.me.slot;
+  const peer = SLOT_PREFIX + S.peer.slot;
   if (!prepend) showDecryptProg(true, 'Loading…', 0);
 
   let query = S.sb.from('messages')
@@ -136,20 +149,29 @@ export async function loadHistory(token, prepend = false) {
 
   const { data, error } = await query;
   if (token !== S.chatToken) return;
-  if (error) { toast('Failed to load messages'); _removeSkeleton(); showDecryptProg(false); return; }
+  if (error) { toast('Failed to load messages'); _removeSkeleton(); showDecryptProg(false); console.error('[loadHistory]', error); return; }
 
   const rows = (data || []).reverse();
   S.hasMore = (data || []).length === PAGE_SIZE;
   if (rows.length > 0) S.oldestCursor = rows[0].created_at;
   if (rows.length > 0) showDecryptProg(true, 'Decrypting…', 0);
 
-  const { results } = await wCallProgress(
-    { type: 'DECRYPT_BATCH', messages: rows.map(r => ({ id: r.id, content: r.content })) },
-    (done, total) => {
-      if (token !== S.chatToken) return;
-      setDecryptProg(Math.round(done / total * 100), `Decrypting ${done}/${total}`);
-    }
-  );
+  let results;
+  try {
+    const resp = await wCallProgress(
+      { type: 'DECRYPT_BATCH', messages: rows.map(r => ({ id: r.id, content: r.content })) },
+      (done, total) => {
+        if (token !== S.chatToken) return;
+        setDecryptProg(Math.round(done / total * 100), `Decrypting ${done}/${total}`);
+      }
+    );
+    results = resp.results;
+  } catch (e) {
+    console.error('[loadHistory] decrypt failed:', e);
+    toast('Decryption error — please reload');
+    _removeSkeleton(); showDecryptProg(false);
+    return;
+  }
   if (token !== S.chatToken) return;
   showDecryptProg(false);
 
@@ -200,7 +222,7 @@ export async function loadHistory(token, prepend = false) {
 
   // ── Persist to IndexedDB in the background ──
   if (cacheEntries.length > 0) {
-    putMessages(S.me.slot, S.peer.slot, cacheEntries).catch(() => {});
+    putMessages(S.me.slot, S.peer.slot, cacheEntries).catch(e => console.warn('[loadHistory] cache write failed:', e));
   }
 
   const unread = rows.filter(r => r.sender_id === peer && !r.read_at).map(r => r.id);
@@ -217,12 +239,12 @@ function _updatePageBtn() {
 ═══════════════════════════════════════════════════════════ */
 function _subMessages(token) {
   if (_msgCh) { try { _msgCh.unsubscribe(); } catch (_) { } _msgCh = null; }
-  const me   = 'slot_' + S.me.slot;
-  const peer = 'slot_' + S.peer.slot;
-  const room = [me, peer].sort().join('--');
+  const me   = SLOT_PREFIX + S.me.slot;
+  const peer = SLOT_PREFIX + S.peer.slot;
+  const room = [me, peer].sort().join(CHANNEL_SEPARATOR);
 
-  _msgCh = S.sb.channel('chat-' + room)
-    .on('broadcast', { event: 'typing' }, payload => {
+  _msgCh = S.sb.channel(CHAT_CHANNEL_PREFIX + room)
+    .on('broadcast', { event: EVT_TYPING }, payload => {
       if (token !== S.chatToken) return;
       if (payload.payload?.from === peer) _receiveTyping(payload.payload.on);
     })
@@ -237,10 +259,10 @@ function _subMessages(token) {
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, payload => {
       const row = payload.new;
       if (token !== S.chatToken) return;
-      if (row.sender_id !== 'slot_' + S.me.slot) return;
+      if (row.sender_id !== SLOT_PREFIX + S.me.slot) return;
       if (row.read_at) {
         updateReceipt(row.id, 'read');
-        markCachedRead(row.id, row.read_at).catch(() => {});
+        markCachedRead(row.id, row.read_at).catch(e => console.warn('[realtime] cache read mark failed:', e));
       }
     })
     .subscribe();
@@ -250,7 +272,15 @@ async function _handleIncoming(row, token) {
   if (token !== S.chatToken) return;
   if (S.isDecoy) return;
   if (S.renderedIds.has(row.id)) return;
-  const { results } = await wCall({ type: 'DECRYPT_BATCH', messages: [{ id: row.id, content: row.content }] });
+  let results;
+  try {
+    const resp = await wCall({ type: 'DECRYPT_BATCH', messages: [{ id: row.id, content: row.content }] });
+    results = resp.results;
+  } catch (e) {
+    console.error('[_handleIncoming] decrypt failed:', e);
+    toast('Failed to decrypt incoming message');
+    return;
+  }
   if (token !== S.chatToken) return;
   const r = results[0];
   if (!r || r.plain === null) { _activateDecoy(); return; }
@@ -263,7 +293,7 @@ async function _handleIncoming(row, token) {
   // Cache the incoming message
   putMessages(S.me.slot, S.peer.slot, [
     { id: row.id, text: d.text, from: 'them', time: row.created_at, readAt: null, replyTo: d.replyTo }
-  ]).catch(() => {});
+  ]).catch(e => console.warn('[_handleIncoming] cache write failed:', e));
 }
 
 export function clearMsgCh() {
@@ -320,7 +350,7 @@ export async function doSend() {
   clearReply();
   bcastTyping(false);
 
-  const optId = 'opt-' + Date.now();
+  const optId = OPTIMISTIC_PREFIX + Date.now();
   S.pendingTexts.set(optId, text);
   renderMsg({ id: optId, text, from: 'me', time: new Date().toISOString(), readAt: null, pending: true, replyTo: replyToId, replyText, replyFrom });
   scrollBottom(true);
@@ -333,12 +363,12 @@ export async function doSend() {
 
   try {
     const encoded = encodeContent(text, replyToId);
-    const { cipher } = await wCall({ type: 'ENCRYPT', plain: encoded });
-    if (!cipher) throw new Error('Encryption returned empty ciphertext');
-    const me   = 'slot_' + S.me.slot;
-    const peer = 'slot_' + S.peer.slot;
+    const encResp = await wCall({ type: 'ENCRYPT', plain: encoded });
+    if (!encResp || !encResp.cipher) throw new Error('Encryption returned empty ciphertext');
+    const me   = SLOT_PREFIX + S.me.slot;
+    const peer = SLOT_PREFIX + S.peer.slot;
     const { data, error } = await S.sb.from('messages').insert({
-      sender_id: me, sender_name: S.me.name, receiver_id: peer, content: cipher,
+      sender_id: me, sender_name: S.me.name, receiver_id: peer, content: encResp.cipher,
     }).select('id,created_at').single();
     if (error) throw error;
     _replaceOptimistic(optId, data.id, data.created_at);
@@ -346,7 +376,7 @@ export async function doSend() {
     // Cache the sent message
     putMessages(S.me.slot, S.peer.slot, [
       { id: data.id, text, from: 'me', time: data.created_at, readAt: null, replyTo: replyToId }
-    ]).catch(() => {});
+    ]).catch(e => console.warn('[doSend] cache write failed:', e));
   } catch (e) {
     _removeOptimistic(optId);
     toast('Failed to send — please try again');
@@ -360,6 +390,8 @@ export async function doSend() {
 
 export async function flushOfflineQueue() {
   if (!S.offlineQueue.length || !S.me || !S.peer) return;
+  // Snapshot pattern: take a copy and clear the queue atomically
+  // to prevent duplicate sends on rapid network reconnects
   const snapshot = [...S.offlineQueue];
   S.offlineQueue = [];
   const failed = [];
@@ -368,21 +400,22 @@ export async function flushOfflineQueue() {
       const text = typeof item === 'string' ? item : item.text;
       const replyToId = typeof item === 'string' ? null : (item.replyTo || null);
       const encoded = encodeContent(text, replyToId);
-      const { cipher } = await wCall({ type: 'ENCRYPT', plain: encoded });
-      if (!cipher) throw new Error('Encryption failed');
-      const me   = 'slot_' + S.me.slot;
-      const peer = 'slot_' + S.peer.slot;
+      const encResp = await wCall({ type: 'ENCRYPT', plain: encoded });
+      if (!encResp || !encResp.cipher) throw new Error('Encryption failed');
+      const me   = SLOT_PREFIX + S.me.slot;
+      const peer = SLOT_PREFIX + S.peer.slot;
       const { data, error } = await S.sb.from('messages').insert({
-        sender_id: me, sender_name: S.me.name, receiver_id: peer, content: cipher,
+        sender_id: me, sender_name: S.me.name, receiver_id: peer, content: encResp.cipher,
       }).select('id,created_at').single();
       if (error) throw error;
       renderMsg({ id: data.id, text, from: 'me', time: data.created_at, readAt: null, replyTo: replyToId });
 
       putMessages(S.me.slot, S.peer.slot, [
         { id: data.id, text, from: 'me', time: data.created_at, readAt: null, replyTo: replyToId }
-      ]).catch(() => {});
+      ]).catch(e => console.warn('[flushOfflineQueue] cache write failed:', e));
     } catch (e) {
       console.error('[flushOfflineQueue] failed:', e);
+      toast('Queued message failed to send');
       failed.push(item);
     }
   }
@@ -420,8 +453,8 @@ export function renderMsg({ id, text, from, time, readAt, pending, replyTo, repl
 
 function _lookupReplyText(replyToId) {
   if (!replyToId) return null;
-  // Look in the rendered message bubbles
-  const el = document.querySelector(`[data-mid="${replyToId}"] .bubble`);
+  // Look in the rendered message bubbles — uses textContent (XSS safe)
+  const el = document.querySelector(`[data-mid="${replyToId}"] .msg-text`);
   return el?.textContent || null;
 }
 
@@ -530,19 +563,24 @@ export function updateReceipt(id, status) {
 
 async function _markRead(ids) {
   if (!ids.length) return;
-  const toMark = ids.filter(id => id && !id.startsWith('opt-'));
+  const toMark = ids.filter(id => id && !id.startsWith(OPTIMISTIC_PREFIX));
   if (!toMark.length) return;
-  for (let i = 0; i < toMark.length; i += 50) {
-    const batch = toMark.slice(i, i + 50);
-    await S.sb.from('messages')
-      .update({ read_at: new Date().toISOString() })
-      .in('id', batch)
-      .is('read_at', null);
-  }
-  // Update cache
-  const now = new Date().toISOString();
-  for (const id of toMark) {
-    markCachedRead(id, now).catch(() => {});
+  try {
+    for (let i = 0; i < toMark.length; i += 50) {
+      const batch = toMark.slice(i, i + 50);
+      await S.sb.from('messages')
+        .update({ read_at: new Date().toISOString() })
+        .in('id', batch)
+        .is('read_at', null);
+    }
+    // Update cache
+    const now = new Date().toISOString();
+    for (const id of toMark) {
+      markCachedRead(id, now).catch(e => console.warn('[_markRead] cache update failed:', e));
+    }
+  } catch (e) {
+    console.error('[_markRead] failed:', e);
+    // Non-fatal: don't toast for read receipts — they'll sync next time
   }
 }
 
@@ -609,7 +647,7 @@ export function onKey(e) {
 export function bcastTyping(on) {
   if (!_msgCh || !S.peer) return;
   if (!on && !S.isTyping && _typingLastBcast === 0) return;
-  _msgCh.send({ type: 'broadcast', event: 'typing', payload: { from: 'slot_' + S.me.slot, on } });
+  _msgCh.send({ type: 'broadcast', event: EVT_TYPING, payload: { from: SLOT_PREFIX + S.me.slot, on } });
   if (!on) { S.isTyping = false; _typingLastBcast = 0; }
 }
 
@@ -624,13 +662,15 @@ function _showTyping(on) {
 }
 
 /* ═══════════════════════════════════════════════════════════
-   SCROLL → LOAD MORE
+   SCROLL → LOAD MORE (percentage-based threshold)
 ═══════════════════════════════════════════════════════════ */
 export function initScrollPagination() {
   const area = document.getElementById('msgs');
   if (!area) return;
   area.addEventListener('scroll', async () => {
-    if (area.scrollTop < 60 && S.hasMore && !S.historyLoading && !S.isDecoy && S.peer) {
+    // Use 10% of total scroll height as threshold instead of fixed 60px
+    const threshold = area.scrollHeight * 0.1;
+    if (area.scrollTop < threshold && S.hasMore && !S.historyLoading && !S.isDecoy && S.peer) {
       S.historyLoading = true;
       document.getElementById('page-loader')?.classList.add('show');
       const prevH = area.scrollHeight;

@@ -1,5 +1,6 @@
 'use strict';
 import { PRESENCE_HEARTBEAT, PRESENCE_LEAVE_DEBOUNCE } from './config.js';
+import { SLOT_PREFIX, PRESENCE_CHANNEL }               from './constants.js';
 import { S }                  from './state.js';
 import { toast, timeAgo }     from './ui.js';
 
@@ -11,47 +12,53 @@ let _presenceCh = null;
 export function subPresence() {
   if (_presenceCh) { try { _presenceCh.unsubscribe(); } catch (_) { } }
 
-  const me = 'slot_' + S.me.slot;
-  _presenceCh = S.sb.channel('presence', { config: { presence: { key: me } } });
+  const me = SLOT_PREFIX + S.me.slot;
+  _presenceCh = S.sb.channel(PRESENCE_CHANNEL, { config: { presence: { key: me } } });
 
   _presenceCh
     .on('presence', { event: 'sync' }, () => {
-      const state = _presenceCh.presenceState();
-      Object.entries(state).forEach(([key, presences]) => {
-        const p = presences[0] || {};
-        const slot = parseInt(key.split('_')[1], 10);
-        if (isNaN(slot)) return;
-        const lastSeen = typeof p.lastSeen === 'number' ? p.lastSeen : null;
-        S.presenceMap[slot] = {
-          _status:   p.status || 'online',
-          _lastSeen: lastSeen,
-        };
-      });
-      renderContacts();
-      if (window.updateChatStatus) window.updateChatStatus();
-    })
-    .on('presence', { event: 'join' }, ({ key, newPresences }) => {
-      const slot = parseInt(key.split('_')[1], 10);
-      if (isNaN(slot)) return;
-      const p = newPresences[0] || {};
-      if (S.presenceLeaveT[slot]) { clearTimeout(S.presenceLeaveT[slot]); delete S.presenceLeaveT[slot]; }
-      const lastSeen = typeof p.lastSeen === 'number' ? p.lastSeen : Date.now();
-      S.presenceMap[slot] = { _status: p.status || 'online', _lastSeen: lastSeen };
-      renderContacts();
-      if (window.updateChatStatus) window.updateChatStatus();
-    })
-    .on('presence', { event: 'leave' }, ({ key, leftPresences }) => {
-      const slot = parseInt(key.split('_')[1], 10);
-      if (isNaN(slot)) return;
-      // Capture lastSeen from the payload before the debounce wipes it
-      const p = (leftPresences && leftPresences[0]) || {};
-      const lastSeen = typeof p.lastSeen === 'number' ? p.lastSeen : Date.now();
-      S.presenceLeaveT[slot] = setTimeout(() => {
-        S.presenceMap[slot] = { _status: 'offline', _lastSeen: lastSeen };
-        delete S.presenceLeaveT[slot];
+      try {
+        const state = _presenceCh.presenceState();
+        Object.entries(state).forEach(([key, presences]) => {
+          const p = presences[0] || {};
+          const slot = parseInt(key.split('_')[1], 10);
+          if (isNaN(slot)) return;
+          const lastSeen = typeof p.lastSeen === 'number' ? p.lastSeen : null;
+          S.presenceMap[slot] = {
+            _status:   p.status || 'online',
+            _lastSeen: lastSeen,
+          };
+        });
         renderContacts();
         if (window.updateChatStatus) window.updateChatStatus();
-      }, PRESENCE_LEAVE_DEBOUNCE);
+      } catch (e) { console.error('[presence.sync]', e); }
+    })
+    .on('presence', { event: 'join' }, ({ key, newPresences }) => {
+      try {
+        const slot = parseInt(key.split('_')[1], 10);
+        if (isNaN(slot)) return;
+        const p = newPresences[0] || {};
+        if (S.presenceLeaveT[slot]) { clearTimeout(S.presenceLeaveT[slot]); delete S.presenceLeaveT[slot]; }
+        const lastSeen = typeof p.lastSeen === 'number' ? p.lastSeen : Date.now();
+        S.presenceMap[slot] = { _status: p.status || 'online', _lastSeen: lastSeen };
+        renderContacts();
+        if (window.updateChatStatus) window.updateChatStatus();
+      } catch (e) { console.error('[presence.join]', e); }
+    })
+    .on('presence', { event: 'leave' }, ({ key, leftPresences }) => {
+      try {
+        const slot = parseInt(key.split('_')[1], 10);
+        if (isNaN(slot)) return;
+        // Capture lastSeen from the payload before the debounce wipes it
+        const p = (leftPresences && leftPresences[0]) || {};
+        const lastSeen = typeof p.lastSeen === 'number' ? p.lastSeen : Date.now();
+        S.presenceLeaveT[slot] = setTimeout(() => {
+          S.presenceMap[slot] = { _status: 'offline', _lastSeen: lastSeen };
+          delete S.presenceLeaveT[slot];
+          renderContacts();
+          if (window.updateChatStatus) window.updateChatStatus();
+        }, PRESENCE_LEAVE_DEBOUNCE);
+      } catch (e) { console.error('[presence.leave]', e); }
     })
     .subscribe(async status => {
       if (status === 'SUBSCRIBED') await _trackPresence();
@@ -94,7 +101,8 @@ export async function renderContacts() {
         .select('slot,display_name,color')
         .eq('slot', otherSlot)
         .single();
-      if (!error && data) { S.peerCache = data; dbUser = data; }
+      if (error) throw error;
+      if (data) { S.peerCache = data; dbUser = data; }
     } catch (e) { console.warn('[renderContacts] fetch failed:', e); }
   }
 

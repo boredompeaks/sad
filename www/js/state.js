@@ -32,6 +32,9 @@ export const S = {
   typingThrottle: null,      // timestamp of last typing broadcast
   typingAutoHide: null,      // remote typing indicator hide handle
 
+  /* ── Reply ── */
+  replyTo:       null,         // { id, text, fromName } — active reply target
+
   /* ── Misc ── */
   presenceHB:    null,
   presenceLeaveT: {},

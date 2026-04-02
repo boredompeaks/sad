@@ -1,18 +1,52 @@
 'use strict';
-import { PAGE_SIZE, MAX_MSG, PBKDF2_ITER, TYPING_THROTTLE, TYPING_TIMEOUT, DECOY } from './config.js';
+import { PAGE_SIZE, MAX_MSG, TYPING_THROTTLE, TYPING_TIMEOUT, DECOY } from './config.js';
+import { SLOT_PREFIX, OPTIMISTIC_PREFIX, CHAT_CHANNEL_PREFIX,
+         CHANNEL_SEPARATOR, EVT_TYPING }          from './constants.js';
 import { S }                        from './state.js';
 import { wCall, wCallProgress }     from './crypto.js';
 import { toast, scrollBottom, resizeTA, showDecryptProg,
          setDecryptProg, fmtTime, fmtDate, btnLoad }  from './ui.js';
 import { renderContacts }           from './presence.js';
+import { putMessages, getMessages, markCachedRead } from './db.js';
 
 let _msgCh = null;
+
+/* ═══════════════════════════════════════════════════════════
+   CONTENT ENCODING — supports plain text and reply metadata.
+   Format: JSON  { "t": "message text", "r": "reply-id" }
+   If the content doesn't parse as JSON with "t", treat it as
+   legacy raw text. This is backward-compatible.
+═══════════════════════════════════════════════════════════ */
+function encodeContent(text, replyToId) {
+  if (!replyToId) return JSON.stringify({ t: text });
+  return JSON.stringify({ t: text, r: replyToId });
+}
+
+function decodeContent(plain) {
+  if (!plain) return { text: '', replyTo: null };
+  try {
+    const obj = JSON.parse(plain);
+    if (typeof obj === 'object' && obj !== null && typeof obj.t === 'string') {
+      return { text: obj.t, replyTo: obj.r || null };
+    }
+  } catch (_) { /* not JSON — treat as legacy raw text */ }
+  return { text: plain, replyTo: null };
+}
 
 /* ═══════════════════════════════════════════════════════════
    OPEN CHAT
 ═══════════════════════════════════════════════════════════ */
 export async function openChat(peer) {
   if (!peer?.slot || !peer?.name) return;
+
+  // ── Cleanly teardown previous chat state ──
+  if (S.peer && _msgCh) {
+    bcastTyping(false); // tell previous peer we stopped typing
+  }
+  clearTimeout(S.typingTimer);
+  clearTimeout(S.typingAutoHide);
+  S.isTyping = false;
+
   const myToken = ++S.chatToken;
   S.peer = peer;
   S.isDecoy = false;
@@ -23,6 +57,7 @@ export async function openChat(peer) {
   S.historyLoading = true;
   S.oldestCursor = null;
   S.hasMore = false;
+  clearReply();
 
   // Header
   const ctAv = document.getElementById('ct-av-el');
@@ -46,7 +81,26 @@ export async function openChat(peer) {
   const badge = document.createElement('div');
   badge.className = 'e2ee-badge'; badge.textContent = '🔐 end-to-end encrypted';
   area.appendChild(badge);
-  _showSkeleton(area);
+
+  // ── Serve from IndexedDB cache first (instant feel) ──
+  let cachedRows = [];
+  try {
+    cachedRows = await getMessages(S.me.slot, peer.slot);
+  } catch (e) {
+    console.warn('[openChat] IndexedDB read failed:', e);
+  }
+
+  if (cachedRows.length > 0 && myToken === S.chatToken) {
+    cachedRows.forEach(row => {
+      renderMsg({ id: row.id, text: row.text, from: row.from, time: row.time, readAt: row.readAt, replyTo: row.replyTo });
+    });
+    scrollBottom();
+    if (cachedRows.length > 0) {
+      S.oldestCursor = cachedRows[0].time;
+    }
+  } else {
+    _showSkeleton(area);
+  }
 
   _subMessages(myToken);
   await loadHistory(myToken, false);
@@ -82,8 +136,8 @@ function _removeSkeleton() { document.getElementById('skel')?.remove(); }
    LOAD HISTORY
 ═══════════════════════════════════════════════════════════ */
 export async function loadHistory(token, prepend = false) {
-  const me   = 'slot_' + S.me.slot;
-  const peer = 'slot_' + S.peer.slot;
+  const me   = SLOT_PREFIX + S.me.slot;
+  const peer = SLOT_PREFIX + S.peer.slot;
   if (!prepend) showDecryptProg(true, 'Loading…', 0);
 
   let query = S.sb.from('messages')
@@ -95,20 +149,29 @@ export async function loadHistory(token, prepend = false) {
 
   const { data, error } = await query;
   if (token !== S.chatToken) return;
-  if (error) { toast('Failed to load messages'); _removeSkeleton(); showDecryptProg(false); return; }
+  if (error) { toast('Failed to load messages'); _removeSkeleton(); showDecryptProg(false); console.error('[loadHistory]', error); return; }
 
   const rows = (data || []).reverse();
   S.hasMore = (data || []).length === PAGE_SIZE;
   if (rows.length > 0) S.oldestCursor = rows[0].created_at;
   if (rows.length > 0) showDecryptProg(true, 'Decrypting…', 0);
 
-  const { results } = await wCallProgress(
-    { type: 'DECRYPT_BATCH', messages: rows.map(r => ({ id: r.id, content: r.content })) },
-    (done, total) => {
-      if (token !== S.chatToken) return;
-      setDecryptProg(Math.round(done / total * 100), `Decrypting ${done}/${total}`);
-    }
-  );
+  let results;
+  try {
+    const resp = await wCallProgress(
+      { type: 'DECRYPT_BATCH', messages: rows.map(r => ({ id: r.id, content: r.content })) },
+      (done, total) => {
+        if (token !== S.chatToken) return;
+        setDecryptProg(Math.round(done / total * 100), `Decrypting ${done}/${total}`);
+      }
+    );
+    results = resp.results;
+  } catch (e) {
+    console.error('[loadHistory] decrypt failed:', e);
+    toast('Decryption error — please reload');
+    _removeSkeleton(); showDecryptProg(false);
+    return;
+  }
   if (token !== S.chatToken) return;
   showDecryptProg(false);
 
@@ -116,11 +179,14 @@ export async function loadHistory(token, prepend = false) {
   _removeSkeleton();
   if (anyFailed) { _activateDecoy(); return; }
 
-  const plainMap = {};
-  results.forEach(r => { plainMap[r.id] = r.plain; });
+  const decoded = {};
+  results.forEach(r => { decoded[r.id] = decodeContent(r.plain); });
 
   const area = document.getElementById('msgs');
   if (!area) return;
+
+  // ── Build cache entries from this fetch ──
+  const cacheEntries = [];
 
   if (prepend) {
     const frag = document.createDocumentFragment();
@@ -128,6 +194,8 @@ export async function loadHistory(token, prepend = false) {
     let lastDateInFrag = null;
     rows.forEach(row => {
       if (S.renderedIds.has(row.id)) return;
+      const d = decoded[row.id];
+      const from = row.sender_id === me ? 'me' : 'them';
       const dStr = new Date(row.created_at).toDateString();
       if (lastDateInFrag !== dStr) {
         const sep = document.createElement('div'); sep.className = 'dsep';
@@ -136,16 +204,25 @@ export async function loadHistory(token, prepend = false) {
         sep.appendChild(lbl); frag.appendChild(sep);
         lastDateInFrag = dStr;
       }
-      _appendMsgToFrag(frag, { id: row.id, text: plainMap[row.id], from: row.sender_id === me ? 'me' : 'them', time: row.created_at, readAt: row.read_at });
+      _appendMsgToFrag(frag, { id: row.id, text: d.text, from, time: row.created_at, readAt: row.read_at, replyTo: d.replyTo });
+      cacheEntries.push({ id: row.id, text: d.text, from, time: row.created_at, readAt: row.read_at, replyTo: d.replyTo });
     });
     if (insertBefore) area.insertBefore(frag, insertBefore);
     else area.appendChild(frag);
   } else {
     rows.forEach(row => {
       if (S.renderedIds.has(row.id)) return;
-      renderMsg({ id: row.id, text: plainMap[row.id], from: row.sender_id === me ? 'me' : 'them', time: row.created_at, readAt: row.read_at });
+      const d = decoded[row.id];
+      const from = row.sender_id === me ? 'me' : 'them';
+      renderMsg({ id: row.id, text: d.text, from, time: row.created_at, readAt: row.read_at, replyTo: d.replyTo });
+      cacheEntries.push({ id: row.id, text: d.text, from, time: row.created_at, readAt: row.read_at, replyTo: d.replyTo });
     });
     scrollBottom();
+  }
+
+  // ── Persist to IndexedDB in the background ──
+  if (cacheEntries.length > 0) {
+    putMessages(S.me.slot, S.peer.slot, cacheEntries).catch(e => console.warn('[loadHistory] cache write failed:', e));
   }
 
   const unread = rows.filter(r => r.sender_id === peer && !r.read_at).map(r => r.id);
@@ -162,12 +239,12 @@ function _updatePageBtn() {
 ═══════════════════════════════════════════════════════════ */
 function _subMessages(token) {
   if (_msgCh) { try { _msgCh.unsubscribe(); } catch (_) { } _msgCh = null; }
-  const me   = 'slot_' + S.me.slot;
-  const peer = 'slot_' + S.peer.slot;
-  const room = [me, peer].sort().join('--');
+  const me   = SLOT_PREFIX + S.me.slot;
+  const peer = SLOT_PREFIX + S.peer.slot;
+  const room = [me, peer].sort().join(CHANNEL_SEPARATOR);
 
-  _msgCh = S.sb.channel('chat-' + room)
-    .on('broadcast', { event: 'typing' }, payload => {
+  _msgCh = S.sb.channel(CHAT_CHANNEL_PREFIX + room)
+    .on('broadcast', { event: EVT_TYPING }, payload => {
       if (token !== S.chatToken) return;
       if (payload.payload?.from === peer) _receiveTyping(payload.payload.on);
     })
@@ -182,8 +259,11 @@ function _subMessages(token) {
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, payload => {
       const row = payload.new;
       if (token !== S.chatToken) return;
-      if (row.sender_id !== 'slot_' + S.me.slot) return;
-      if (row.read_at) updateReceipt(row.id, 'read');
+      if (row.sender_id !== SLOT_PREFIX + S.me.slot) return;
+      if (row.read_at) {
+        updateReceipt(row.id, 'read');
+        markCachedRead(row.id, row.read_at).catch(e => console.warn('[realtime] cache read mark failed:', e));
+      }
     })
     .subscribe();
 }
@@ -192,18 +272,53 @@ async function _handleIncoming(row, token) {
   if (token !== S.chatToken) return;
   if (S.isDecoy) return;
   if (S.renderedIds.has(row.id)) return;
-  const { results } = await wCall({ type: 'DECRYPT_BATCH', messages: [{ id: row.id, content: row.content }] });
+  let results;
+  try {
+    const resp = await wCall({ type: 'DECRYPT_BATCH', messages: [{ id: row.id, content: row.content }] });
+    results = resp.results;
+  } catch (e) {
+    console.error('[_handleIncoming] decrypt failed:', e);
+    toast('Failed to decrypt incoming message');
+    return;
+  }
   if (token !== S.chatToken) return;
   const r = results[0];
   if (!r || r.plain === null) { _activateDecoy(); return; }
-  renderMsg({ id: row.id, text: r.plain, from: 'them', time: row.created_at, readAt: null });
+  const d = decodeContent(r.plain);
+  renderMsg({ id: row.id, text: d.text, from: 'them', time: row.created_at, readAt: null, replyTo: d.replyTo });
   scrollBottom(true);
   _markRead([row.id]);
   _showTyping(false);
+
+  // Cache the incoming message
+  putMessages(S.me.slot, S.peer.slot, [
+    { id: row.id, text: d.text, from: 'them', time: row.created_at, readAt: null, replyTo: d.replyTo }
+  ]).catch(e => console.warn('[_handleIncoming] cache write failed:', e));
 }
 
 export function clearMsgCh() {
   if (_msgCh) { try { _msgCh.unsubscribe(); } catch (_) { } _msgCh = null; }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   REPLY STATE
+═══════════════════════════════════════════════════════════ */
+export function setReply(id, text, fromName) {
+  S.replyTo = { id, text, fromName };
+  const bar = document.getElementById('reply-bar');
+  if (bar) {
+    const nameEl = bar.querySelector('.reply-name');
+    const textEl = bar.querySelector('.reply-text');
+    if (nameEl) nameEl.textContent = fromName || '';
+    if (textEl) textEl.textContent = (text || '').slice(0, 80);
+    bar.classList.add('show');
+  }
+  document.getElementById('msg-inp')?.focus();
+}
+
+export function clearReply() {
+  S.replyTo = null;
+  document.getElementById('reply-bar')?.classList.remove('show');
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -219,20 +334,25 @@ export async function doSend() {
   if (text.length > MAX_MSG) { text = text.slice(0, MAX_MSG); toast('Message trimmed to 4000 chars'); }
 
   if (!navigator.onLine) {
-    S.offlineQueue.push(text);
+    S.offlineQueue.push({ text, replyTo: S.replyTo?.id || null });
     inp.value = ''; resizeTA(inp);
     document.getElementById('send-b').disabled = true;
+    clearReply();
     toast('Offline — message queued'); return;
   }
 
   S.sendInflight = true;
+  const replyToId = S.replyTo?.id || null;
+  const replyText = S.replyTo?.text || null;
+  const replyFrom = S.replyTo?.fromName || null;
   inp.value = ''; resizeTA(inp);
   document.getElementById('send-b').disabled = true;
+  clearReply();
   bcastTyping(false);
 
-  const optId = 'opt-' + Date.now();
+  const optId = OPTIMISTIC_PREFIX + Date.now();
   S.pendingTexts.set(optId, text);
-  renderMsg({ id: optId, text, from: 'me', time: new Date().toISOString(), readAt: null, pending: true });
+  renderMsg({ id: optId, text, from: 'me', time: new Date().toISOString(), readAt: null, pending: true, replyTo: replyToId, replyText, replyFrom });
   scrollBottom(true);
 
   const sendBtn = document.getElementById('send-b');
@@ -242,15 +362,21 @@ export async function doSend() {
   window.Capacitor?.Plugins?.Haptics?.impact({ style: 'MEDIUM' }).catch(()=>{});
 
   try {
-    const { cipher } = await wCall({ type: 'ENCRYPT', plain: text });
-    if (!cipher) throw new Error('Encryption returned empty ciphertext');
-    const me   = 'slot_' + S.me.slot;
-    const peer = 'slot_' + S.peer.slot;
+    const encoded = encodeContent(text, replyToId);
+    const encResp = await wCall({ type: 'ENCRYPT', plain: encoded });
+    if (!encResp || !encResp.cipher) throw new Error('Encryption returned empty ciphertext');
+    const me   = SLOT_PREFIX + S.me.slot;
+    const peer = SLOT_PREFIX + S.peer.slot;
     const { data, error } = await S.sb.from('messages').insert({
-      sender_id: me, sender_name: S.me.name, receiver_id: peer, content: cipher,
+      sender_id: me, sender_name: S.me.name, receiver_id: peer, content: encResp.cipher,
     }).select('id,created_at').single();
     if (error) throw error;
     _replaceOptimistic(optId, data.id, data.created_at);
+
+    // Cache the sent message
+    putMessages(S.me.slot, S.peer.slot, [
+      { id: data.id, text, from: 'me', time: data.created_at, readAt: null, replyTo: replyToId }
+    ]).catch(e => console.warn('[doSend] cache write failed:', e));
   } catch (e) {
     _removeOptimistic(optId);
     toast('Failed to send — please try again');
@@ -264,23 +390,33 @@ export async function doSend() {
 
 export async function flushOfflineQueue() {
   if (!S.offlineQueue.length || !S.me || !S.peer) return;
+  // Snapshot pattern: take a copy and clear the queue atomically
+  // to prevent duplicate sends on rapid network reconnects
   const snapshot = [...S.offlineQueue];
   S.offlineQueue = [];
   const failed = [];
-  for (const text of snapshot) {
+  for (const item of snapshot) {
     try {
-      const { cipher } = await wCall({ type: 'ENCRYPT', plain: text });
-      if (!cipher) throw new Error('Encryption failed');
-      const me   = 'slot_' + S.me.slot;
-      const peer = 'slot_' + S.peer.slot;
+      const text = typeof item === 'string' ? item : item.text;
+      const replyToId = typeof item === 'string' ? null : (item.replyTo || null);
+      const encoded = encodeContent(text, replyToId);
+      const encResp = await wCall({ type: 'ENCRYPT', plain: encoded });
+      if (!encResp || !encResp.cipher) throw new Error('Encryption failed');
+      const me   = SLOT_PREFIX + S.me.slot;
+      const peer = SLOT_PREFIX + S.peer.slot;
       const { data, error } = await S.sb.from('messages').insert({
-        sender_id: me, sender_name: S.me.name, receiver_id: peer, content: cipher,
+        sender_id: me, sender_name: S.me.name, receiver_id: peer, content: encResp.cipher,
       }).select('id,created_at').single();
       if (error) throw error;
-      renderMsg({ id: data.id, text, from: 'me', time: data.created_at, readAt: null });
+      renderMsg({ id: data.id, text, from: 'me', time: data.created_at, readAt: null, replyTo: replyToId });
+
+      putMessages(S.me.slot, S.peer.slot, [
+        { id: data.id, text, from: 'me', time: data.created_at, readAt: null, replyTo: replyToId }
+      ]).catch(e => console.warn('[flushOfflineQueue] cache write failed:', e));
     } catch (e) {
       console.error('[flushOfflineQueue] failed:', e);
-      failed.push(text);
+      toast('Queued message failed to send');
+      failed.push(item);
     }
   }
   if (failed.length) S.offlineQueue.unshift(...failed);
@@ -290,14 +426,14 @@ export async function flushOfflineQueue() {
 /* ═══════════════════════════════════════════════════════════
    RENDER MESSAGES
 ═══════════════════════════════════════════════════════════ */
-function _appendMsgToFrag(frag, { id, text, from, time, readAt, pending }) {
+function _appendMsgToFrag(frag, { id, text, from, time, readAt, pending, replyTo, replyText, replyFrom }) {
   if (S.renderedIds.has(id)) return;
   S.renderedIds.add(id);
-  frag.appendChild(_buildMsgRow({ id, text, from, time, readAt, pending }));
+  frag.appendChild(_buildMsgRow({ id, text, from, time, readAt, pending, replyTo, replyText, replyFrom }));
   S.messages.unshift({ id, time }); // older → front
 }
 
-export function renderMsg({ id, text, from, time, readAt, pending }) {
+export function renderMsg({ id, text, from, time, readAt, pending, replyTo, replyText, replyFrom }) {
   if (S.renderedIds.has(id)) return;
   S.renderedIds.add(id);
   const area = document.getElementById('msgs');
@@ -312,16 +448,52 @@ export function renderMsg({ id, text, from, time, readAt, pending }) {
     sep.appendChild(lbl); area.appendChild(sep);
   }
   S.messages.push({ id, time });
-  area.appendChild(_buildMsgRow({ id, text, from, time, readAt, pending }));
+  area.appendChild(_buildMsgRow({ id, text, from, time, readAt, pending, replyTo, replyText, replyFrom }));
 }
 
-function _buildMsgRow({ id, text, from, time, readAt, pending }) {
+function _lookupReplyText(replyToId) {
+  if (!replyToId) return null;
+  // Look in the rendered message bubbles — uses textContent (XSS safe)
+  const el = document.querySelector(`[data-mid="${replyToId}"] .msg-text`);
+  return el?.textContent || null;
+}
+
+function _buildMsgRow({ id, text, from, time, readAt, pending, replyTo, replyText, replyFrom }) {
   const row = document.createElement('div');
   row.className = 'msg-r ' + from;
   row.dataset.mid = id;
   const bub  = document.createElement('div');
   bub.className = 'bubble' + (pending ? ' pending' : '');
-  bub.textContent = text; // textContent — XSS safe
+
+  // ── Reply quote ──
+  if (replyTo) {
+    const quoteWrap = document.createElement('div');
+    quoteWrap.className = 'reply-quote';
+    const qName = document.createElement('span');
+    qName.className = 'reply-quote-name';
+    qName.textContent = replyFrom || (from === 'me' ? (S.peer?.name || '') : (S.me?.name || ''));
+    const qText = document.createElement('span');
+    qText.className = 'reply-quote-text';
+    qText.textContent = (replyText || _lookupReplyText(replyTo) || '…').slice(0, 80);
+    quoteWrap.appendChild(qName);
+    quoteWrap.appendChild(qText);
+    quoteWrap.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const target = document.querySelector(`[data-mid="${replyTo}"]`);
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.add('msg-flash');
+        setTimeout(() => target.classList.remove('msg-flash'), 1200);
+      }
+    });
+    bub.appendChild(quoteWrap);
+  }
+
+  const textNode = document.createElement('span');
+  textNode.className = 'msg-text';
+  textNode.textContent = text; // textContent — XSS safe
+  bub.appendChild(textNode);
+
   const meta = document.createElement('div'); meta.className = 'msg-meta';
   const ts   = document.createElement('span'); ts.className = 'mt';
   ts.textContent = fmtTime(time);
@@ -334,6 +506,23 @@ function _buildMsgRow({ id, text, from, time, readAt, pending }) {
     meta.appendChild(rc);
   }
   row.appendChild(bub); row.appendChild(meta);
+
+  // ── Long-press / double-click to reply ──
+  let _longT = null;
+  row.addEventListener('touchstart', () => {
+    _longT = setTimeout(() => {
+      window.Capacitor?.Plugins?.Haptics?.impact({ style: 'LIGHT' }).catch(()=>{});
+      const senderName = from === 'me' ? S.me?.name : S.peer?.name;
+      setReply(id, text, senderName);
+    }, 500);
+  }, { passive: true });
+  row.addEventListener('touchend',    () => { clearTimeout(_longT); }, { passive: true });
+  row.addEventListener('touchcancel', () => { clearTimeout(_longT); }, { passive: true });
+  row.addEventListener('dblclick', () => {
+    const senderName = from === 'me' ? S.me?.name : S.peer?.name;
+    setReply(id, text, senderName);
+  });
+
   return row;
 }
 
@@ -374,14 +563,24 @@ export function updateReceipt(id, status) {
 
 async function _markRead(ids) {
   if (!ids.length) return;
-  const toMark = ids.filter(id => id && !id.startsWith('opt-'));
+  const toMark = ids.filter(id => id && !id.startsWith(OPTIMISTIC_PREFIX));
   if (!toMark.length) return;
-  for (let i = 0; i < toMark.length; i += 50) {
-    const batch = toMark.slice(i, i + 50);
-    await S.sb.from('messages')
-      .update({ read_at: new Date().toISOString() })
-      .in('id', batch)
-      .is('read_at', null);
+  try {
+    for (let i = 0; i < toMark.length; i += 50) {
+      const batch = toMark.slice(i, i + 50);
+      await S.sb.from('messages')
+        .update({ read_at: new Date().toISOString() })
+        .in('id', batch)
+        .is('read_at', null);
+    }
+    // Update cache
+    const now = new Date().toISOString();
+    for (const id of toMark) {
+      markCachedRead(id, now).catch(e => console.warn('[_markRead] cache update failed:', e));
+    }
+  } catch (e) {
+    console.error('[_markRead] failed:', e);
+    // Non-fatal: don't toast for read receipts — they'll sync next time
   }
 }
 
@@ -448,7 +647,7 @@ export function onKey(e) {
 export function bcastTyping(on) {
   if (!_msgCh || !S.peer) return;
   if (!on && !S.isTyping && _typingLastBcast === 0) return;
-  _msgCh.send({ type: 'broadcast', event: 'typing', payload: { from: 'slot_' + S.me.slot, on } });
+  _msgCh.send({ type: 'broadcast', event: EVT_TYPING, payload: { from: SLOT_PREFIX + S.me.slot, on } });
   if (!on) { S.isTyping = false; _typingLastBcast = 0; }
 }
 
@@ -463,13 +662,15 @@ function _showTyping(on) {
 }
 
 /* ═══════════════════════════════════════════════════════════
-   SCROLL → LOAD MORE
+   SCROLL → LOAD MORE (percentage-based threshold)
 ═══════════════════════════════════════════════════════════ */
 export function initScrollPagination() {
   const area = document.getElementById('msgs');
   if (!area) return;
   area.addEventListener('scroll', async () => {
-    if (area.scrollTop < 60 && S.hasMore && !S.historyLoading && !S.isDecoy && S.peer) {
+    // Use 10% of total scroll height as threshold instead of fixed 60px
+    const threshold = area.scrollHeight * 0.1;
+    if (area.scrollTop < threshold && S.hasMore && !S.historyLoading && !S.isDecoy && S.peer) {
       S.historyLoading = true;
       document.getElementById('page-loader')?.classList.add('show');
       const prevH = area.scrollHeight;

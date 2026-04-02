@@ -1,5 +1,6 @@
 'use strict';
 import { S }                     from './state.js';
+import { SLOT_PREFIX }           from './constants.js';
 import { wCallProgress }         from './crypto.js';
 import { toast, showOverlay, hideOverlay, fmtTime, fmtDate, fmtExportDate } from './ui.js';
 
@@ -9,8 +10,8 @@ export async function doExport() {
   toast('Preparing export…');
   showOverlay('Exporting conversation…');
   try {
-    const me   = 'slot_' + S.me.slot;
-    const peer = 'slot_' + S.peer.slot;
+    const me   = SLOT_PREFIX + S.me.slot;
+    const peer = SLOT_PREFIX + S.peer.slot;
     const { data, error } = await S.sb.from('messages')
       .select('id,sender_id,sender_name,content,created_at')
       .or(`and(sender_id.eq.${me},receiver_id.eq.${peer}),and(sender_id.eq.${peer},receiver_id.eq.${me})`)
@@ -24,7 +25,20 @@ export async function doExport() {
       () => { }
     );
     const pMap = {};
-    results.forEach(r => { pMap[r.id] = r.plain; });
+    results.forEach(r => {
+      if (r.plain === null) { pMap[r.id] = null; return; }
+      // Decode JSON content format (reply-to support)
+      try {
+        const obj = JSON.parse(r.plain);
+        if (typeof obj === 'object' && obj !== null && typeof obj.t === 'string') {
+          pMap[r.id] = obj.t;
+        } else {
+          pMap[r.id] = r.plain;
+        }
+      } catch (_) {
+        pMap[r.id] = r.plain; // legacy raw text
+      }
+    });
     if (results.some(r => r.plain === null)) { toast('Some messages could not be decrypted'); return; }
 
     const now  = new Date();

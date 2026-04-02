@@ -1,11 +1,13 @@
 'use strict';
 import { createClient }                          from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
 import { SB_URL, SB_KEY, PBKDF2_ITER, RL_GRACE, RL_SCHED } from './config.js';
+import { SALT_PREFIX }                              from './constants.js';
 import { S }                                      from './state.js';
 import { wCall, initWorker }                      from './crypto.js';
 import { toast, showOverlay, hideOverlay,
          showScreen, btnLoad,
          buildAvRow, buildEmojiPicker, delay }    from './ui.js';
+import { clearCache }                             from './db.js';
 
 /* ═══════════════════════════════════════════════════════════
    SANITIZE / VALIDATE
@@ -198,7 +200,8 @@ export async function doRegister() {
         .from('cipher_config').upsert({ id: 1, passphrase_salt: passphraseSalt });
       if (cfgErr) {
         console.error('cipher_config upsert failed:', cfgErr);
-        toast('⚠️ Could not save encryption config — both users must re-register');
+        toast('⚠️ Could not save encryption config — registration aborted');
+        return; // ABORT: proceeding without a persisted salt creates an unusable account
       }
     }
 
@@ -211,7 +214,8 @@ export async function doRegister() {
     }
 
     showOverlay('Securing your session…');
-    await wCall({ type: 'DERIVE_KEY', passphrase: phrase, salt: 'cipher-e2ee-v3-' + passphraseSalt, iters: PBKDF2_ITER });
+    const keyResp = await wCall({ type: 'DERIVE_KEY', passphrase: phrase, salt: SALT_PREFIX + passphraseSalt, iters: PBKDF2_ITER });
+    if (!keyResp) throw new Error('Key derivation returned empty response');
     S.me = { slot, name, color: S.selectedColor };
     S.isDecoy = false;
     updateAuthUI(used.length + 1);
@@ -268,7 +272,8 @@ export async function doLogin() {
       return;
     }
 
-    await wCall({ type: 'DERIVE_KEY', passphrase: phrase, salt: 'cipher-e2ee-v3-' + passphraseSalt, iters: PBKDF2_ITER });
+    const keyResp = await wCall({ type: 'DERIVE_KEY', passphrase: phrase, salt: SALT_PREFIX + passphraseSalt, iters: PBKDF2_ITER });
+    if (!keyResp) throw new Error('Key derivation returned empty response');
     S.me = { slot: matched.slot, name: matched.display_name, color: matched.color };
     S.isDecoy = false;
     await initApp();
@@ -289,6 +294,9 @@ export function setChannelClearFns(presenceFn, msgFn) {
 }
 
 export function doLogout() {
+  // Guard — prevent accidental data loss
+  if (!window.confirm('Sign out? Your local message cache will be cleared.')) return;
+
   // 1 — Cancel timers
   clearTimeout(S.typingTimer);
   clearTimeout(S.typingAutoHide);
@@ -314,19 +322,23 @@ export function doLogout() {
   S.msgQueue = []; S.historyLoading = false;
   S.isTyping = false; S.typingTimer = null;
   S.typingThrottle = null; S.typingAutoHide = null;
+  S.replyTo = null;
   S.presenceHB = null; S.presenceLeaveT = {};
   S.chatToken = 0; S.sendInflight = false;
   S.offlineQueue = [];
   S.theme = savedTheme;
   // S.rl intentionally kept (lock persists across sessions)
 
-  // 5 — Clear inputs
+  // 5 — Clear IndexedDB cache
+  clearCache().catch(() => {});
+
+  // 6 — Clear inputs
   ['rn', 'rp', 'rph', 'lp', 'lph'].forEach(id => {
     const el = document.getElementById(id); if (el) el.value = '';
   });
   clearFE('e-rn', 'e-rp', 'e-rph', 'e-lp', 'e-lph');
 
-  // 6 — Back to auth screen
+  // 7 — Back to auth screen
   getSlotCount()
     .then(c => { updateAuthUI(c); showScreen('auth'); })
     .catch(() => showScreen('auth'));

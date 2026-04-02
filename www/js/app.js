@@ -12,9 +12,10 @@ import { subPresence, clearPresenceCh, renderContacts,
          updateChatStatus, onVisibility,
          onOnline, onOffline, closeMobile }                 from './presence.js';
 import { openChat, doSend, flushOfflineQueue, bcastTyping,
-         onInput, onKey, clearMsgCh, initScrollPagination } from './messages.js';
+         onInput, onKey, clearMsgCh, initScrollPagination,
+         clearReply }                                        from './messages.js';
 import { doExport }                                         from './export.js';
-import { toggleTheme, tpwd, toggleEmoji }                  from './ui.js';
+import { toggleTheme, initTheme, tpwd, toggleEmoji }         from './ui.js';
 
 /* ── Break circular deps by injecting callbacks ── */
 setPresenceSubFn(subPresence);
@@ -30,6 +31,8 @@ window.bcastTyping     = bcastTyping;
    DOM-READY — bind every event listener
 ═══════════════════════════════════════════════════════════ */
 document.addEventListener('DOMContentLoaded', () => {
+
+  initTheme();
 
   /* ── Auth tabs ── */
   document.getElementById('tab-in')?.addEventListener('click', () => switchTab('in'));
@@ -60,6 +63,9 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('back-btn')?.addEventListener('click', closeMobile);
   document.getElementById('export-btn')?.addEventListener('click', doExport);
   document.getElementById('chat-theme-btn')?.addEventListener('click', toggleTheme);
+
+  /* ── Reply bar close ── */
+  document.getElementById('reply-close')?.addEventListener('click', clearReply);
 
   /* ── Message input ── */
   const inp = document.getElementById('msg-inp');

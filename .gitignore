@@ -9,3 +9,4 @@ build/
 *.env
 supabase/migrations/
 supabase/.temp/
+

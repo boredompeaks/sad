@@ -15,7 +15,7 @@ import { openChat, doSend, flushOfflineQueue, bcastTyping,
          onInput, onKey, clearMsgCh, initScrollPagination,
          clearReply }                                        from './messages.js';
 import { doExport }                                         from './export.js';
-import { toggleTheme, tpwd, toggleEmoji }                  from './ui.js';
+import { toggleTheme, initTheme, tpwd, toggleEmoji }         from './ui.js';
 
 /* ── Break circular deps by injecting callbacks ── */
 setPresenceSubFn(subPresence);
@@ -31,6 +31,8 @@ window.bcastTyping     = bcastTyping;
    DOM-READY — bind every event listener
 ═══════════════════════════════════════════════════════════ */
 document.addEventListener('DOMContentLoaded', () => {
+
+  initTheme();
 
   /* ── Auth tabs ── */
   document.getElementById('tab-in')?.addEventListener('click', () => switchTab('in'));
