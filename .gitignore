@@ -1,0 +1,11 @@
+node_modules/
+android/
+ios/
+dist/
+build/
+.expo/
+*.log
+.DS_Store
+*.env
+supabase/migrations/
+supabase/.temp/
