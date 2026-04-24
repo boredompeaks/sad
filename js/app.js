@@ -6,26 +6,33 @@
  */
 'use strict';
 
-import { boot, doRegister, doLogin, doLogout,
-         switchTab, setPresenceSubFn, setChannelClearFns } from './auth.js';
-import { subPresence, clearPresenceCh, renderContacts,
-         updateChatStatus, onVisibility,
-         onOnline, onOffline, closeMobile }                 from './presence.js';
-import { openChat, doSend, flushOfflineQueue, bcastTyping,
-         onInput, onKey, clearMsgCh, initScrollPagination,
-         clearReply }                                        from './messages.js';
-import { doExport }                                         from './export.js';
-import { toggleTheme, initTheme, tpwd, toggleEmoji }         from './ui.js';
+import {
+  boot, doRegister, doLogin, doLogout,
+  switchTab, setPresenceSubFn, setChannelClearFns
+} from './auth.js';
+import {
+  subPresence, clearPresenceCh, renderContacts,
+  updateChatStatus, onVisibility,
+  onOnline, onOffline, closeMobile
+} from './presence.js';
+import {
+  openChat, doSend, flushOfflineQueue, bcastTyping,
+  onInput, onKey, clearMsgCh, initScrollPagination,
+  clearReply, resubMessages, jumpToBottom
+} from './messages.js';
+import { doExport } from './export.js';
+import { toggleTheme, initTheme, tpwd, toggleEmoji } from './ui.js';
 
 /* ── Break circular deps by injecting callbacks ── */
 setPresenceSubFn(subPresence);
 setChannelClearFns(clearPresenceCh, clearMsgCh);
 
-/* ── Globals needed by presence.js (calls window.xxx to avoid circular import) ── */
-window.openChat        = openChat;
-window.updateChatStatus = updateChatStatus;
+/* ── Globals needed by presence.js / app lifecycle ── */
+window.openChat          = openChat;
+window.updateChatStatus  = updateChatStatus;   // called by presence.js on every presence event
 window.flushOfflineQueue = flushOfflineQueue;
-window.bcastTyping     = bcastTyping;
+window.bcastTyping       = bcastTyping;
+window.resubMessages     = resubMessages; // called by presence.onOnline
 
 /* ═══════════════════════════════════════════════════════════
    DOM-READY — bind every event listener
@@ -50,6 +57,9 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById(id)?.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
   });
 
+  /* ── Boot retry button ── */
+  document.getElementById('boot-retry-btn')?.addEventListener('click', boot);
+
   /* ── Password visibility toggles — use data-target attr ── */
   document.querySelectorAll('.pt[data-target]').forEach(btn => {
     btn.addEventListener('click', () => tpwd(btn.dataset.target, btn));
@@ -64,13 +74,39 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('export-btn')?.addEventListener('click', doExport);
   document.getElementById('chat-theme-btn')?.addEventListener('click', toggleTheme);
 
+  /* ── Jump-to-bottom FAB ── */
+  document.getElementById('jump-btn')?.addEventListener('click', jumpToBottom);
+
+  /* ── Dropdowns ── */
+  const toggleDropdown = (id) => {
+    document.querySelectorAll('.dropdown.show').forEach(d => {
+      if (d.id !== id) d.classList.remove('show');
+    });
+    document.getElementById(id)?.classList.toggle('show');
+  };
+  document.getElementById('sb-menu-btn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleDropdown('sb-dropdown');
+  });
+  document.getElementById('ct-menu-btn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleDropdown('ct-dropdown');
+  });
+
+  // Close dropdowns on outside click or when clicking a menu item
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.dropdown') || e.target.closest('.dropdown-item')) {
+      document.querySelectorAll('.dropdown.show').forEach(d => d.classList.remove('show'));
+    }
+  });
+
   /* ── Reply bar close ── */
   document.getElementById('reply-close')?.addEventListener('click', clearReply);
 
   /* ── Message input ── */
   const inp = document.getElementById('msg-inp');
   if (inp) {
-    inp.addEventListener('input',   onInput);
+    inp.addEventListener('input', onInput);
     inp.addEventListener('keydown', onKey);
     inp.addEventListener('paste', e => {
       const txt = e.clipboardData?.getData('text') || '';
@@ -95,30 +131,40 @@ document.addEventListener('DOMContentLoaded', () => {
   /* ── Send ── */
   document.getElementById('send-b')?.addEventListener('click', doSend);
 
-  /* ── Scroll pagination ── */
+  /* ── Scroll pagination + Jump FAB ── */
   initScrollPagination();
 
   /* ── Capacitor / Visual Viewport (keyboard avoidance) ── */
   if (window.Capacitor?.Plugins?.Keyboard) {
     const Keyboard = window.Capacitor.Plugins.Keyboard;
     Keyboard.addListener('keyboardWillShow', info => {
-      const sApp = document.getElementById('s-app');
-      if (sApp) sApp.style.paddingBottom = info.keyboardHeight + 'px';
+      if (window.Capacitor.getPlatform() === 'android') return;
+      const pane = document.getElementById('chat-pane');
+      if (pane) pane.style.setProperty('--kb-height', info.keyboardHeight + 'px');
       import('./ui.js').then(({ scrollBottom }) => scrollBottom(false));
     });
     Keyboard.addListener('keyboardWillHide', () => {
-      const sApp = document.getElementById('s-app');
-      if (sApp) sApp.style.paddingBottom = '0px';
+      if (window.Capacitor.getPlatform() === 'android') return;
+      const pane = document.getElementById('chat-pane');
+      if (pane) pane.style.removeProperty('--kb-height');
     });
   } else if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', () => {
+      const chatPane = document.getElementById('chat-pane');
+      if (!chatPane) return;
       const chatUI = document.getElementById('chat-ui');
-      if (!chatUI || chatUI.style.display === 'none') return;
-      const vv     = window.visualViewport;
+      if (!chatUI || chatUI.style.display === 'none') {
+        chatPane.style.removeProperty('--kb-height');
+        return;
+      }
+      const vv = window.visualViewport;
       const offset = window.innerHeight - vv.height - vv.offsetTop;
-      const sApp   = document.getElementById('s-app');
-      if (sApp) sApp.style.paddingBottom = offset > 0 ? offset + 'px' : '0';
-      import('./ui.js').then(({ scrollBottom }) => scrollBottom(false));
+      if (offset > 0) {
+        chatPane.style.setProperty('--kb-height', offset + 'px');
+        import('./ui.js').then(({ scrollBottom }) => scrollBottom(false));
+      } else {
+        chatPane.style.removeProperty('--kb-height');
+      }
     });
   }
 
@@ -135,10 +181,25 @@ document.addEventListener('DOMContentLoaded', () => {
           else App.exitApp();
         }
       });
+      App.addListener('appStateChange', ({ isActive }) => {
+        if (!isActive) {
+          // App backgrounded — mark as away immediately
+          import('./presence.js').then(p => {
+             if (p.onVisibility) p.onVisibility('away');
+          });
+        } else {
+          // App returned to foreground — flush queue + recover channels
+          if (window.flushOfflineQueue) window.flushOfflineQueue();
+          if (navigator.onLine) {
+            import('./presence.js').then(p => p.onVisibility());
+            if (window.resubMessages) window.resubMessages();
+          }
+        }
+      });
     }
     if (StatusBar) {
-      StatusBar.setOverlaysWebView({ overlay: true }).catch(() => {});
-      StatusBar.setStyle({ style: 'DARK' }).catch(() => {});
+      StatusBar.setOverlaysWebView({ overlay: true }).catch(() => { });
+      StatusBar.setStyle({ style: 'DARK' }).catch(() => { });
     }
   }
 
@@ -149,6 +210,6 @@ document.addEventListener('DOMContentLoaded', () => {
   /* ── Visibility (away/online presence) ── */
   document.addEventListener('visibilitychange', onVisibility);
 
-  /* ── Boot the app ── */
+  /* ── Boot ── */
   boot();
 });

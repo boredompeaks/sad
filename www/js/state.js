@@ -4,7 +4,11 @@ import { AV_COLORS } from './config.js';
 /**
  * Single shared mutable state object.
  * All modules import this same reference — mutations are visible everywhere.
+ *
+ * Version stamp: bump SESSION_VERSION when breaking changes require a full logout.
  */
+export const SESSION_VERSION = 1;
+
 export const S = {
   sb:        null,   // Supabase client (set in auth.js boot())
   isDecoy:   false,
@@ -34,6 +38,14 @@ export const S = {
 
   /* ── Reply ── */
   replyTo:       null,         // { id, text, fromName } — active reply target
+
+  /* ── Realtime health ── */
+  isReconnecting:    false,  // true while message channel is reconnecting
+  reconnectAttempts: 0,      // backoff counter for message channel reconnects
+  reconnectTimer:    null,   // handle for scheduled reconnect attempt
+
+  /* ── Unread ── */
+  unreadCount:   0,          // messages received while chat is not active / scrolled away
 
   /* ── Misc ── */
   presenceHB:    null,

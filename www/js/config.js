@@ -32,8 +32,9 @@ export const RL_SCHED         = [5000, 15000, 45000, 120_000, 300_000];
 /* ── Typing / Presence ── */
 export const TYPING_THROTTLE        = 2000;
 export const TYPING_TIMEOUT         = 4000;
-export const PRESENCE_HEARTBEAT     = 25_000;
-export const PRESENCE_LEAVE_DEBOUNCE = 800;
+export const PRESENCE_HEARTBEAT      = 25_000;
+export const PRESENCE_LEAVE_DEBOUNCE  = 4_000;
+export const PRESENCE_AWAY_TIMEOUT    = 120_000; // 2 minutes of inactivity = away
 
 /* ── Decoy conversation ── */
 export const DECOY = [

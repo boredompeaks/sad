@@ -47,7 +47,11 @@ let _aesKey = null;
 self.onmessage = async ({ data: msg }) => {
   const { id, type } = msg;
   try {
-    if (type === 'CLEAR_KEY') {
+    // ── Health check ───────────────────────────────────────────────────────
+    if (type === 'PING') {
+      self.postMessage({ id, type: 'PONG' });
+
+    } else if (type === 'CLEAR_KEY') {
       _aesKey = null;
       self.postMessage({ id, type: 'KEY_CLEARED' });
 
@@ -63,22 +67,33 @@ self.onmessage = async ({ data: msg }) => {
 
     } else if (type === 'HASH_PW') {
       const { password, iters } = msg;
+      if (!password || typeof password !== 'string')
+        throw new Error('HASH_PW: password must be a non-empty string');
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const hash = await pbkdf2Hash(password, salt, iters);
       self.postMessage({ id, type: 'PW_HASH', result: iters + ':' + hex(salt.buffer) + ':' + hash });
 
     } else if (type === 'VERIFY_PW') {
       const { password, stored } = msg;
+      if (!password || !stored) { self.postMessage({ id, type: 'PW_VERIFY', ok: false }); return; }
       const parts = stored.split(':');
       if (parts.length !== 3) { self.postMessage({ id, type: 'PW_VERIFY', ok: false }); return; }
       const iters = parseInt(parts[0], 10);
       const salt  = unhex(parts[1]);
       const hash  = parts[2];
-      const got   = await pbkdf2Hash(password, salt, iters);
+      if (isNaN(iters) || iters < 1000 || !salt.length || !hash) {
+        self.postMessage({ id, type: 'PW_VERIFY', ok: false }); return;
+      }
+      const got = await pbkdf2Hash(password, salt, iters);
       self.postMessage({ id, type: 'PW_VERIFY', ok: got === hash });
 
     } else if (type === 'ENCRYPT') {
-      if (!_aesKey) { self.postMessage({ id, type: 'ENCRYPTED', err: 'no key' }); return; }
+      if (!_aesKey) {
+        self.postMessage({ id, type: 'ERROR', error: 'No encryption key — please log in again' });
+        return;
+      }
+      if (!msg.plain || typeof msg.plain !== 'string')
+        throw new Error('ENCRYPT: plain must be a non-empty string');
       const iv  = crypto.getRandomValues(new Uint8Array(12));
       const ct  = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, _aesKey, ENC.encode(msg.plain));
       const buf = new Uint8Array(12 + ct.byteLength);
@@ -86,12 +101,19 @@ self.onmessage = async ({ data: msg }) => {
       self.postMessage({ id, type: 'ENCRYPTED', cipher: btoa(String.fromCharCode(...buf)) });
 
     } else if (type === 'DECRYPT_BATCH') {
+      if (!_aesKey) {
+        self.postMessage({ id, type: 'ERROR', error: 'No decryption key — please log in again' });
+        return;
+      }
       const { messages, isExport } = msg;
+      if (!Array.isArray(messages)) throw new Error('DECRYPT_BATCH: messages must be an array');
       const results = [];
       for (let i = 0; i < messages.length; i++) {
         const { id: mid, content } = messages[i];
         try {
+          if (!content || typeof content !== 'string') throw new Error('Empty content');
           const buf = Uint8Array.from(atob(content), c => c.charCodeAt(0));
+          if (buf.length < 13) throw new Error('Ciphertext too short');
           const pt  = await crypto.subtle.decrypt(
             { name: 'AES-GCM', iv: buf.slice(0, 12) }, _aesKey, buf.slice(12)
           );
@@ -101,8 +123,12 @@ self.onmessage = async ({ data: msg }) => {
           self.postMessage({ id, type: 'BATCH_PROGRESS', done: i + 1, total: messages.length });
       }
       self.postMessage({ id, type: 'BATCH_DONE', results });
+
+    } else {
+      // Unknown message type — don't silently swallow
+      self.postMessage({ id, type: 'ERROR', error: `Unknown message type: ${type}` });
     }
   } catch (e) {
-    self.postMessage({ id, type: 'ERROR', error: e.message });
+    self.postMessage({ id, type: 'ERROR', error: e.message || String(e) });
   }
 };

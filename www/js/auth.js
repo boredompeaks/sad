@@ -6,8 +6,13 @@ import { S }                                      from './state.js';
 import { wCall, initWorker }                      from './crypto.js';
 import { toast, showOverlay, hideOverlay,
          showScreen, btnLoad,
-         buildAvRow, buildEmojiPicker, delay }    from './ui.js';
+         buildAvRow, buildEmojiPicker, delay,
+         showBootError, hideBootError }           from './ui.js';
 import { clearCache }                             from './db.js';
+import { withTimeout, withRetry, isRetryable }   from './utils.js';
+// Preferences accessed at runtime via Capacitor global — bare-specifier imports
+// are not resolvable by the browser's native ES module system without a bundler.
+function _getPrefs() { return window.Capacitor?.Plugins?.Preferences ?? null; }
 
 /* ═══════════════════════════════════════════════════════════
    SANITIZE / VALIDATE
@@ -82,7 +87,10 @@ export function rlReset() {
    HELPERS
 ═══════════════════════════════════════════════════════════ */
 export async function getSlotCount() {
-  const { data, error } = await S.sb.from('cipher_users').select('slot');
+  const { data, error } = await withRetry(
+    () => withTimeout(S.sb.from('cipher_users').select('slot'), 10000, 'getSlotCount'),
+    { maxAttempts: 3, operationName: 'getSlotCount', shouldRetry: isRetryable }
+  );
   if (error) throw error;
   return (data || []).length;
 }
@@ -102,6 +110,7 @@ export function updateAuthUI(count) {
   }
 }
 export function switchTab(t) {
+  import('./ui.js').then(({ haptic }) => haptic('LIGHT'));
   document.getElementById('f-in')?.setAttribute('style', t === 'in' ? '' : 'display:none');
   document.getElementById('f-up')?.setAttribute('style', t === 'up' ? '' : 'display:none');
   document.getElementById('tab-in')?.classList.toggle('on', t === 'in');
@@ -112,24 +121,34 @@ export function switchTab(t) {
    BOOT
 ═══════════════════════════════════════════════════════════ */
 export async function boot() {
+  hideBootError();
   initWorker();
   _setBootProg(20, 'connecting…');
   try {
-    S.sb = createClient(SB_URL, SB_KEY);
+    if (!S.sb) {
+      S.sb = createClient(SB_URL, SB_KEY);
+    }
     _setBootProg(55, 'checking accounts…');
-    const count = await getSlotCount();
+    const count = await withRetry(
+      () => withTimeout(
+        S.sb.from('cipher_users').select('slot').then(r => { if (r.error) throw r.error; return r; }),
+        10000, 'boot'
+      ),
+      { maxAttempts: 3, baseDelay: 1000, operationName: 'boot', shouldRetry: isRetryable }
+    );
     _setBootProg(100, 'ready');
     await delay(300);
     buildAvRow();
     buildEmojiPicker();
-    updateAuthUI(count);
+    updateAuthUI((count.data || []).length);
     showScreen('auth');
   } catch (e) {
     _setBootProg(100, 'connection failed');
-    toast('Could not connect — check your config');
     console.error('[boot]', e);
+    showBootError('Could not connect — tap to retry');
   }
 }
+
 function _setBootProg(p, lbl) {
   const b = document.getElementById('boot-prog');
   const l = document.getElementById('boot-lbl');
@@ -152,9 +171,18 @@ export async function initApp() {
     myAv.style.background = S.me.color;
   }
   const mn = document.getElementById('my-name-el');
-  if (mn) mn.textContent = S.me.name; // textContent — XSS safe
+  if (mn) mn.textContent = S.me.name;
+
+  // Pre-fetch peer data before showing the screen to avoid "loading lag"
+  if (_presenceSubFn) {
+    _presenceSubFn();
+    await delay(150);
+  }
+
+  // Ensure the UI shows our own presence status in the profile section
+  import('./presence.js').then(({ renderMyStatus }) => renderMyStatus());
+
   showScreen('app');
-  if (_presenceSubFn) _presenceSubFn();
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -176,7 +204,11 @@ export async function doRegister() {
   btnLoad(btn, true, 'Creating…');
   showOverlay('Creating your account…');
   try {
-    const { data: ex, error: exErr } = await S.sb.from('cipher_users').select('slot');
+    // Check slot availability with retry
+    const { data: ex, error: exErr } = await withRetry(
+      () => withTimeout(S.sb.from('cipher_users').select('slot'), 10000, 'Check Slots'),
+      { maxAttempts: 3, operationName: 'checkSlots', shouldRetry: isRetryable }
+    );
     if (exErr) throw exErr;
     const used = (ex || []).map(r => r.slot);
     if (used.length >= 2) { toast('Registration is full'); updateAuthUI(2); return; }
@@ -185,19 +217,26 @@ export async function doRegister() {
     const { result: pHash } = await wCall({ type: 'HASH_PW', password: pass, iters: PBKDF2_ITER });
     if (!pHash) throw new Error('Password hashing failed');
 
-    // Fetch or create shared passphrase salt
+    // Fetch or create shared passphrase salt with retry
     let passphraseSalt = null;
     try {
-      const { data: cfg } = await S.sb
-        .from('cipher_config').select('passphrase_salt').eq('id', 1).single();
+      const { data: cfg } = await withRetry(
+        () => withTimeout(
+          S.sb.from('cipher_config').select('passphrase_salt').eq('id', 1).single(),
+          10000, 'Get Salt'
+        ),
+        { maxAttempts: 2, operationName: 'getSalt', shouldRetry: isRetryable }
+      );
       passphraseSalt = cfg?.passphrase_salt || null;
-    } catch (_) { /* table missing or no row yet */ }
+    } catch (_) { /* table missing or no row yet — will create below */ }
 
     if (!passphraseSalt) {
       const saltBytes = crypto.getRandomValues(new Uint8Array(16));
       passphraseSalt = Array.from(saltBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-      const { error: cfgErr } = await S.sb
-        .from('cipher_config').upsert({ id: 1, passphrase_salt: passphraseSalt });
+      const { error: cfgErr } = await withTimeout(
+        S.sb.from('cipher_config').upsert({ id: 1, passphrase_salt: passphraseSalt }),
+        10000, 'Save Salt'
+      );
       if (cfgErr) {
         console.error('cipher_config upsert failed:', cfgErr);
         toast('⚠️ Could not save encryption config — registration aborted');
@@ -205,9 +244,15 @@ export async function doRegister() {
       }
     }
 
-    const { error: ie } = await S.sb.from('cipher_users').insert({
-      slot, display_name: name, password_hash: pHash, color: S.selectedColor,
-    });
+    const { error: ie } = await withRetry(
+      () => withTimeout(
+        S.sb.from('cipher_users').insert({
+          slot, display_name: name, password_hash: pHash, color: S.selectedColor,
+        }),
+        10000, 'Create User'
+      ),
+      { maxAttempts: 2, operationName: 'createUser', shouldRetry: isRetryable }
+    );
     if (ie) {
       if (ie.code === '23505') { toast('Slot taken — please try again'); return; }
       throw ie;
@@ -218,6 +263,9 @@ export async function doRegister() {
     if (!keyResp) throw new Error('Key derivation returned empty response');
     S.me = { slot, name, color: S.selectedColor };
     S.isDecoy = false;
+    try {
+      await _getPrefs()?.set({ key: 'cipherState', value: JSON.stringify({ slot: S.me.slot, name: S.me.name }) });
+    } catch(e) { console.warn('Preferences save err', e); }
     updateAuthUI(used.length + 1);
     toast(`Welcome, ${name}!`);
     await initApp();
@@ -242,8 +290,13 @@ export async function doLogin() {
   btnLoad(btn, true, 'Signing in…');
   showOverlay('Verifying your credentials…');
   try {
-    const { data: users, error } = await S.sb
-      .from('cipher_users').select('slot,display_name,color,password_hash');
+    const { data: users, error } = await withRetry(
+      () => withTimeout(
+        S.sb.from('cipher_users').select('slot,display_name,color,password_hash'),
+        10000, 'Fetch Users'
+      ),
+      { maxAttempts: 3, operationName: 'fetchUsers', shouldRetry: isRetryable }
+    );
     if (error) throw error;
     if (!users?.length) { fe('e-lp', 'No accounts registered yet'); rlFail(); return; }
 
@@ -258,11 +311,16 @@ export async function doLogin() {
     rlReset();
     showOverlay('Securing your session…');
 
-    // Fetch shared passphrase salt — MUST match the salt stored during registration
+    // Fetch shared passphrase salt with retry
     let passphraseSalt = null;
     try {
-      const { data: cfg } = await S.sb
-        .from('cipher_config').select('passphrase_salt').eq('id', 1).single();
+      const { data: cfg } = await withRetry(
+        () => withTimeout(
+          S.sb.from('cipher_config').select('passphrase_salt').eq('id', 1).single(),
+          10000, 'Get Salt'
+        ),
+        { maxAttempts: 3, operationName: 'getSaltLogin', shouldRetry: isRetryable }
+      );
       passphraseSalt = cfg?.passphrase_salt || null;
     } catch (_) { }
 
@@ -276,6 +334,9 @@ export async function doLogin() {
     if (!keyResp) throw new Error('Key derivation returned empty response');
     S.me = { slot: matched.slot, name: matched.display_name, color: matched.color };
     S.isDecoy = false;
+    try {
+      await _getPrefs()?.set({ key: 'cipherState', value: JSON.stringify({ slot: S.me.slot, name: S.me.name }) });
+    } catch(e) { console.warn('Preferences save err', e); }
     await initApp();
   } catch (e) {
     toast('Sign in failed — please try again');
@@ -294,10 +355,21 @@ export function setChannelClearFns(presenceFn, msgFn) {
 }
 
 export function doLogout() {
-  // Guard — prevent accidental data loss
-  if (!window.confirm('Sign out? Your local message cache will be cleared.')) return;
+  // Show native-free confirmation via the context menu
+  import('./ui.js').then(({ showContextMenu }) => {
+    showContextMenu([
+      {
+        label: 'Sign out & clear cache',
+        icon: '🚪',
+        danger: true,
+        action: _performLogout,
+      }
+    ]);
+  });
+}
 
-  // 1 — Cancel timers
+function _performLogout() {
+  import('./ui.js').then(({ haptic }) => haptic('MEDIUM'));
   clearTimeout(S.typingTimer);
   clearTimeout(S.typingAutoHide);
   clearInterval(S.presenceHB);
@@ -327,18 +399,23 @@ export function doLogout() {
   S.chatToken = 0; S.sendInflight = false;
   S.offlineQueue = [];
   S.theme = savedTheme;
+  S.isReconnecting = false; S.reconnectAttempts = 0;
+  S.unreadCount = 0;
   // S.rl intentionally kept (lock persists across sessions)
 
   // 5 — Clear IndexedDB cache
   clearCache().catch(() => {});
 
-  // 6 — Clear inputs
+  // 6 — Clear stored session
+  try { _getPrefs()?.remove({ key: 'cipherState' }).catch(() => {}); } catch (_) {}
+
+  // 7 — Clear inputs
   ['rn', 'rp', 'rph', 'lp', 'lph'].forEach(id => {
     const el = document.getElementById(id); if (el) el.value = '';
   });
   clearFE('e-rn', 'e-rp', 'e-rph', 'e-lp', 'e-lph');
 
-  // 7 — Back to auth screen
+  // 8 — Back to auth screen
   getSlotCount()
     .then(c => { updateAuthUI(c); showScreen('auth'); })
     .catch(() => showScreen('auth'));
